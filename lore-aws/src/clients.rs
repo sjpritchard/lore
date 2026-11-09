@@ -6,6 +6,7 @@ use std::time::Duration;
 use aws_config::meta::region::ProvideRegion;
 use aws_sdk_dynamodb::config::ProvideCredentials;
 use aws_sdk_dynamodb::operation::describe_table::DescribeTableError;
+use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_smithy_http_client::Builder as HttpClientBuilder;
 use aws_smithy_http_client::Connector;
@@ -102,6 +103,25 @@ impl Default for HttpClientSettings {
     }
 }
 
+/// Names the provider of credentials given in configuration, in SDK logs and errors.
+const STATIC_CREDENTIALS_PROVIDER_NAME: &str = "lore-config";
+
+/// An access key pair given in configuration rather than found by the default credential chain.
+#[derive(Clone)]
+pub struct StaticCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+impl std::fmt::Debug for StaticCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AwsClientBuilder<State>(State);
 
@@ -150,6 +170,21 @@ impl AwsClientBuilder<WantsAwsConfig> {
         self.0.config = self.0.config.credentials_provider(credentials_provider);
 
         self
+    }
+
+    /// Uses `credentials` instead of the default credential chain when given, so one client can
+    /// hold a different identity from the others in the same process.
+    pub fn maybe_static_credentials(self, credentials: Option<StaticCredentials>) -> Self {
+        match credentials {
+            Some(credentials) => self.with_credentials_provider(Credentials::new(
+                credentials.access_key_id,
+                credentials.secret_access_key,
+                None,
+                None,
+                STATIC_CREDENTIALS_PROVIDER_NAME,
+            )),
+            None => self,
+        }
     }
 
     pub fn region(mut self, region: impl ProvideRegion + 'static) -> Self {

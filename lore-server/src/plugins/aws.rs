@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use lore_aws::clients::AwsClientBuilder;
 use lore_aws::clients::HttpClientSettings;
+use lore_aws::clients::StaticCredentials;
 use lore_aws::clients::TimeoutConfig;
 use lore_aws::store::immutable_store::AwsImmutableStore;
 use lore_aws::store::immutable_store::AwsImmutableStoreSettings;
@@ -51,6 +52,17 @@ const PLUGIN_NAME: &str = "aws";
 ///
 /// This configuration is deserialized from TOML and contains all settings
 /// needed to create an [`AwsImmutableStore`].
+/// A configuration string that is printed as `<redacted>`, so secrets stay out of logs.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct RedactedString(pub String);
+
+impl std::fmt::Debug for RedactedString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct AwsImmutableStorePluginConfig {
@@ -68,6 +80,16 @@ pub struct AwsImmutableStorePluginConfig {
     /// Optional S3 region.
     #[serde(default)]
     pub s3_region: Option<String>,
+
+    /// Optional access key ID for the S3 client only, for an S3-compatible store that issues its
+    /// own keys. Set together with `s3_secret_access_key`. Unset, S3 uses the default AWS
+    /// credential chain, which `DynamoDB` always uses.
+    #[serde(default)]
+    pub s3_access_key_id: Option<String>,
+
+    /// Secret access key paired with `s3_access_key_id`. Never logged.
+    #[serde(default)]
+    pub s3_secret_access_key: Option<RedactedString>,
 
     /// `DynamoDB` table name for storing fragment associations.
     pub dynamodb_fragments_table: String,
@@ -202,6 +224,37 @@ pub struct AwsLockStorePluginConfig {
     pub timeout_millis: u64,
 }
 
+impl AwsImmutableStorePluginConfig {
+    /// The key pair the S3 client uses instead of the default credential chain, if one is set.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the missing or empty half when only one of `s3_access_key_id` and
+    /// `s3_secret_access_key` is set, or either is empty.
+    pub fn s3_credentials(&self) -> Result<Option<StaticCredentials>, String> {
+        match (&self.s3_access_key_id, &self.s3_secret_access_key) {
+            (None, None) => Ok(None),
+            (Some(access_key_id), Some(RedactedString(secret_access_key))) => {
+                if access_key_id.is_empty() || secret_access_key.is_empty() {
+                    return Err(
+                        "s3_access_key_id and s3_secret_access_key must not be empty".to_owned(),
+                    );
+                }
+                Ok(Some(StaticCredentials {
+                    access_key_id: access_key_id.clone(),
+                    secret_access_key: secret_access_key.clone(),
+                }))
+            }
+            (Some(_), None) => {
+                Err("s3_access_key_id is set without s3_secret_access_key".to_owned())
+            }
+            (None, Some(_)) => {
+                Err("s3_secret_access_key is set without s3_access_key_id".to_owned())
+            }
+        }
+    }
+}
+
 fn default_slow_threshold() -> u64 {
     u64::MAX
 }
@@ -229,13 +282,19 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
         let plugin_name = self.name();
 
         // Deserialize and validate configuration without creating AWS clients
-        let _plugin_config: AwsImmutableStorePluginConfig =
+        let plugin_config: AwsImmutableStorePluginConfig =
             config.clone().try_into().map_err(|e| {
                 PluginError::from(PluginConfigError {
                     plugin_name: plugin_name.to_string(),
                     message: format!("Failed to deserialize AWS immutable store config: {e}"),
                 })
             })?;
+        plugin_config.s3_credentials().map_err(|message| {
+            PluginError::from(PluginConfigError {
+                plugin_name: plugin_name.to_string(),
+                message,
+            })
+        })?;
 
         Ok(())
     }
@@ -251,6 +310,13 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
                     message: format!("Failed to deserialize AWS immutable store config: {e}"),
                 })
             })?;
+
+        let s3_credentials = plugin_config.s3_credentials().map_err(|message| {
+            PluginError::from(PluginConfigError {
+                plugin_name: plugin_name.to_string(),
+                message,
+            })
+        })?;
 
         info!(
             plugin_name = plugin_name,
@@ -271,6 +337,7 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
                         .with_http_settings(&plugin_config.http)
                         .maybe_endpoint(plugin_config.s3_endpoint_url.clone())
                         .maybe_region(plugin_config.s3_region.clone())
+                        .maybe_static_credentials(s3_credentials)
                         .with_timeout_config(
                             TimeoutConfig::builder()
                                 .operation_timeout(Duration::from_millis(

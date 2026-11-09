@@ -35,6 +35,12 @@ mode = "aws"
 s3_bucket = "lore-fragments"
 # s3_endpoint_url = "http://localhost:4566"
 # s3_region = "us-east-1"
+# Keys for the S3 client only, for an S3-compatible store that issues its own (MinIO, R2,
+# a bucket in another account). Set both or neither; unset, S3 uses the default AWS credential
+# chain like DynamoDB. Prefer the environment for the secret:
+# LORE__PLUGINS__AWS__IMMUTABLE_STORE__S3_SECRET_ACCESS_KEY.
+# s3_access_key_id = "..."
+# s3_secret_access_key = "..."
 s3_slow_operation_threshold_millis = 5000
 s3_timeout_millis = 30000
 

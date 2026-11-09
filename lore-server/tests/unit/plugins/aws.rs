@@ -281,3 +281,96 @@ async fn test_lock_store_config_error_includes_field_name() {
         config_err.message
     );
 }
+
+const MINIMAL_IMMUTABLE_STORE_CONFIG: &str = r#"
+    s3_bucket = "test-bucket"
+    dynamodb_fragments_table = "fragments"
+    dynamodb_fragment_state_table = "fragment-state"
+"#;
+
+fn immutable_store_config(extra: &str) -> toml::Value {
+    toml::from_str(&format!("{MINIMAL_IMMUTABLE_STORE_CONFIG}{extra}")).unwrap()
+}
+
+/// Without S3 keys the S3 client keeps the default credential chain, as before.
+#[tokio::test]
+async fn test_s3_credentials_default_to_the_credential_chain() {
+    let config = immutable_store_config("");
+    AwsImmutableStorePluginFactory
+        .validate_config(&config)
+        .expect("a configuration without S3 keys is valid");
+
+    let plugin_config: AwsImmutableStorePluginConfig = config.try_into().unwrap();
+    assert!(plugin_config.s3_access_key_id.is_none());
+    assert!(plugin_config.s3_secret_access_key.is_none());
+    assert!(plugin_config.s3_credentials().unwrap().is_none());
+}
+
+/// An S3-compatible store with its own keys gets them, and the secret never reaches the log line
+/// that prints the whole configuration.
+#[tokio::test]
+async fn test_s3_credentials_are_read_and_the_secret_is_redacted() {
+    let config = immutable_store_config(
+        r#"
+        s3_access_key_id = "store-key"
+        s3_secret_access_key = "store-secret"
+        "#,
+    );
+    AwsImmutableStorePluginFactory
+        .validate_config(&config)
+        .expect("a complete S3 key pair is valid");
+
+    let plugin_config: AwsImmutableStorePluginConfig = config.try_into().unwrap();
+    let credentials = plugin_config
+        .s3_credentials()
+        .unwrap()
+        .expect("the S3 key pair is configured");
+    assert_eq!(credentials.access_key_id, "store-key");
+    assert_eq!(credentials.secret_access_key, "store-secret");
+
+    let printed = format!("{plugin_config:?} {credentials:?}");
+    assert!(
+        !printed.contains("store-secret"),
+        "the secret was printed: {printed}"
+    );
+}
+
+#[tokio::test]
+async fn test_s3_credentials_refuse_half_a_key_pair() {
+    for (extra, missing) in [
+        (r#"s3_access_key_id = "store-key""#, "s3_secret_access_key"),
+        (
+            r#"s3_secret_access_key = "store-secret""#,
+            "s3_access_key_id",
+        ),
+    ] {
+        let err = AwsImmutableStorePluginFactory
+            .validate_config(&immutable_store_config(extra))
+            .expect_err("half a key pair must be refused");
+        let config_err = err
+            .as_plugin_config_error()
+            .expect("should be PluginConfigError");
+        assert_eq!(config_err.plugin_name, PLUGIN_NAME);
+        assert!(
+            config_err.message.contains(missing),
+            "the error should name {missing}, got: {}",
+            config_err.message
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_s3_credentials_refuse_empty_values() {
+    let err = AwsImmutableStorePluginFactory
+        .validate_config(&immutable_store_config(
+            r#"
+            s3_access_key_id = ""
+            s3_secret_access_key = "store-secret"
+            "#,
+        ))
+        .expect_err("an empty key must be refused");
+    let config_err = err
+        .as_plugin_config_error()
+        .expect("should be PluginConfigError");
+    assert!(config_err.message.contains("must not be empty"));
+}
